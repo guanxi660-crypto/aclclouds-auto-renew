@@ -1,17 +1,19 @@
 # ACLClouds Auto-Renew
 
-ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1 天才开放续期。脚本用账号密码登录（OCR 过站点自定义验证码），发现真实 server id，调用续期 API。GitHub Actions 每天跑一次，结果发 Telegram。
+ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1 天才开放续期。脚本用账号密码登录（OCR 过站点自定义验证码），发现真实 server id，调用续期 API。GitHub Actions 每两天跑一次，结果发 Telegram。
 
 ## 做什么
 
 1. Playwright 打开 `/auth/login`，填 `ACL_USERNAME` / `ACL_PASSWORD`
 2. 点「I am not a robot」，四选一词图用 tesseract.js 对 prompt 识别后点击
-3. 登录进 dashboard，扫页面链接 + `/api/client` / `/api/client/credits/subscriptions` 找 server id
+3. 登录进 dashboard，调 `/api/client` 拿服务列表（含真实 server id 与 `expires_at`）
 4. `POST /api/client/servers/{id}/upgrade/renew`
    - `200` 续期成功
    - `400 renewal_not_available` 未到窗口（按成功处理）
+   - `403 captcha_required` 走 `renewal_gate` 验证码后重试
    - 其它状态当失败
-5. Telegram 通知（见下）
+5. API 失败时才启用 UI 兜底（点 dashboard 的「Renouveler」按钮，含弹窗过盾）
+6. Telegram 通知（见下）
 
 实测：账号 `aclbot_638370` 的真实 server id 是 `da9333c4`（不是面板 URL 里的 `5c0ab2ab`）。
 
@@ -27,7 +29,7 @@ ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1
 
 ## GitHub Actions
 
-`.github/workflows/renew.yml`：每天 UTC `03:17`，也可手动 Run workflow。
+`.github/workflows/renew.yml`：每两天 UTC `23:28`（北京时间次日 `07:28`），也可手动 Run workflow。
 
 Secrets：
 
@@ -66,6 +68,9 @@ node with-env.cjs
 - 登录成功写入 `auth.json`，Actions cache 下次跳过验证码；失效则删掉重登
 - `403 captcha_required` 再过一次验证码后重试续期
 - 未设 `ACL_SERVER_ID` 时对发现的每台都续；设了则只打这一台
+- API 优先、UI 兜底：UI 逻辑全程 try/catch，页面异常不再中断整条续期链路
+- 续期按钮只认「可见」元素（`firstVisible`），修掉隐藏按钮导致 `click` 30s 超时的问题
+- 回归测试：`node test_ocr.mjs`（纯函数）+ `node repro-hidden-btn.mjs`（隐藏按钮场景），已接入 workflow
 
 **待做**
 

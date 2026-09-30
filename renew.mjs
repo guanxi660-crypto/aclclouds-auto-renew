@@ -12,6 +12,17 @@ const SERVER_ID = process.env.ACL_SERVER_ID || '';
 const DRY_RUN = process.env.DRY_RUN === '1' || process.env.DRY_RUN === 'true';
 const AUTH = path.resolve(process.env.ACL_AUTH_STATE || 'auth.json');
 const SHOT = path.resolve('shots');
+
+// 全局超时：默认 30s 太长，UI 交互最多等 8s 就够，避免无谓空等。
+const DEFAULT_TIMEOUT = Number(process.env.ACL_TIMEOUT_MS || 15000);
+const UI_TIMEOUT = Number(process.env.ACL_UI_TIMEOUT_MS || 8000);
+
+// UI 续期按钮候选（按钮命中优先，避免误伤导航链接）
+const RENEW_BTN_SEL = [
+  'button:has-text("Renouveler")',
+  'button:has-text("Renew")',
+].join(', ');
+
 const VOCAB = [
   'Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds',
   'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated',
@@ -19,7 +30,6 @@ const VOCAB = [
 ];
 
 fs.mkdirSync(SHOT, { recursive: true });
-const shots = [];
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -50,12 +60,37 @@ function ocrScore(text, guess, prompt) {
   return Math.max(score(text, prompt), score(guess, prompt));
 }
 
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+
 async function shot(page, name) {
   const p = path.join(SHOT, name);
   await page.screenshot({ path: p, fullPage: true });
-  shots.push(p);
   log(`截图 ${name}`);
   return p;
+}
+
+/**
+ * 返回 locator 中第一个「可见」的元素，找不到返回 null。
+ * 原实现用 count()>0 判断存在性，会把隐藏元素算进去，
+ * 导致 click() 等可见性 30s 后超时。
+ */
+async function firstVisible(locator, limit = 12) {
+  let n = 0;
+  try {
+    n = Math.min(await locator.count(), limit);
+  } catch {
+    return null;
+  }
+  for (let i = 0; i < n; i++) {
+    const el = locator.nth(i);
+    const visible = await el.isVisible().catch(() => false);
+    if (visible) return el;
+  }
+  return null;
 }
 
 async function sendTgPhoto(chat, token, photoPath, caption) {
@@ -132,19 +167,19 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
     title,
     '━━━━━━━━━━━━━━━━━━━━',
     `🕒 <b>执行时间</b>: ${beijingTime} (北京时间)`,
-    `👤 <b>当前账号</b>: <code>${USER || '未设置'}</code>`,
+    `👤 <b>当前账号</b>: <code>${escapeHtml(USER || '未设置')}</code>`,
     `📊 <b>任务状态</b>: ${badge}`,
     '━━━━━━━━━━━━━━━━━━━━',
     '<b>服务详情</b>:',
   ];
 
   if (failed && errorMsg) {
-    lines.push(`• 异常原因: ${errorMsg}`);
+    lines.push(`• 异常原因: ${escapeHtml(errorMsg)}`);
   }
 
   for (const r of results) {
     const icon = r.ok ? (r.skip ? '⏳' : '✅') : '❌';
-    lines.push(`• ${icon} ${r.text}`);
+    lines.push(`• ${icon} ${escapeHtml(r.text)}`);
   }
 
   lines.push('━━━━━━━━━━━━━━━━━━━━');
@@ -153,7 +188,7 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
   } else if (hasRenewed) {
     lines.push('✨ 服务已成功延期，将在下次预定周期继续自动守护。');
   } else {
-    lines.push('📌 站点限制到期前 2 天方可续期，下次执行将自动处理。');
+    lines.push('📌 站点限制到期前 1 天才开放续期，下次执行将自动处理。');
   }
 
   return lines.join('\n');
@@ -183,15 +218,15 @@ async function ocrPick(dir, prompt, n) {
 async function solveCaptcha(page, prefix = '') {
   const root = prefix ? `${prefix} ` : '';
   const checkbox = page.locator(`${root}div[role='checkbox']`).first();
-  await checkbox.click();
-  await page.waitForSelector(`${root}.auth-captcha-option-img`, { timeout: 20000 });
+  await checkbox.click({ timeout: DEFAULT_TIMEOUT });
+  await page.waitForSelector(`${root}.auth-captcha-option-img`, { timeout: DEFAULT_TIMEOUT });
   await page.waitForFunction(
     (sel) => {
       const imgs = [...document.querySelectorAll(sel)];
       return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
     },
     `${root}.auth-captcha-option-img`,
-    { timeout: 20000 }
+    { timeout: DEFAULT_TIMEOUT }
   );
 
   const promptRaw = await page.locator(`${root}.auth-captcha-prompt`).innerText();
@@ -215,7 +250,7 @@ async function solveCaptcha(page, prefix = '') {
   await page.waitForFunction(
     (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
     `${root}div[role='checkbox']`,
-    { timeout: 15000 }
+    { timeout: DEFAULT_TIMEOUT }
   );
   log(`验证码通过: ${prompt} -> option ${pick + 1}`);
 }
@@ -327,20 +362,22 @@ async function login(page) {
   await page.fill('#password', PASS);
   await shot(page, '01-login.png');
   let authed = false;
+  let lastErr = '';
   for (let i = 0; i < 4 && !authed; i++) {
     try {
       await solveCaptcha(page);
       authed = true;
     } catch (e) {
+      lastErr = e.message;
       log(`验证码失败(${i + 1}/4): ${e.message}`);
       await page.reload({ waitUntil: 'domcontentloaded' });
       await page.fill('#username', USER);
       await page.fill('#password', PASS);
     }
   }
-  if (!authed) throw new Error('验证码多次失败');
+  if (!authed) throw new Error(`验证码多次失败: ${lastErr}`);
   await page.click("button[type='submit']");
-  await page.waitForURL(/\/dashboard/, { timeout: 25000 });
+  await page.waitForURL(/\/dashboard/, { timeout: DEFAULT_TIMEOUT + 10000 });
   await page.context().storageState({ path: AUTH });
   log(`登录成功,会话写入 ${AUTH}`);
 }
@@ -404,54 +441,71 @@ function classifyRenew(r) {
   return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
 }
 
-async function tryRenew(page, server) {
-  const id = server.id;
-  const name = server.name || id;
-  log(`开始检查续期: ${name} (${id})`);
+/**
+ * 纯函数：从页面文本判断续期是否成功。抽出来便于单测。
+ * 兼容法/英/中三种界面文案。
+ */
+function classifyUiText(text) {
+  const t = String(text || '');
+  const m = t.match(/(?:Expire dans|Expires in|到期)\s*([0-9]+\s*(?:j|jours?|d|days?|天)(?:\s*[0-9]+\s*(?:h|heures?|hours?|小时))?)/i);
+  const remaining = m ? m[1].replace(/\s+/g, '') : null;
+  const confirmed =
+    /(?:Expire dans|Expires in)\s*(?:[2-9]|[1-9][0-9]+)\s*(?:j|jours?|d|days?|天)/i.test(t) ||
+    /(?:renouvellement|renewal)\s*(?:effectué|réussi|successful|complete|completed)/i.test(t) ||
+    /(?:renewed successfully|renewal successful|renewal complete)/i.test(t);
+  return { confirmed, remaining };
+}
 
-  if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
-
-  // 1. UI 自动化续期
+/**
+ * UI 续期路径 —— 仅作为 API 失败后的兜底。
+ * 关键点：全程 try/catch，任何异常都只返回 null，绝不向上抛，
+ * 否则会像旧版那样把整条续期链路带崩。
+ */
+async function renewViaUi(page, id, name) {
+  log('UI 兜底: 打开 /dashboard/projects');
   await page.goto(`${BASE}/dashboard/projects`, { waitUntil: 'domcontentloaded' }).catch(() => {});
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+
+  const btn = await firstVisible(page.locator(RENEW_BTN_SEL));
+  if (!btn) {
+    log('UI 兜底: 页面上没有「可见」的续期按钮,放弃 UI 路径');
+    return null;
+  }
+
+  log('UI 兜底: 找到可见续期按钮,执行点击...');
+  await btn.click({ timeout: UI_TIMEOUT });
   await page.waitForTimeout(1500);
 
-  const renewBtn = page.locator('button:has-text("Renouveler"), button:has-text("Renew")').first();
-  const hasBtn = (await renewBtn.count()) > 0;
-
-  if (hasBtn) {
-    log(`找到 UI 续期按钮,执行点击...`);
-    await renewBtn.click();
-    await page.waitForTimeout(2000);
-
-    const modal = page.locator("[role='dialog']");
-    if ((await modal.count()) > 0) {
-      log('检测到防机器人人机验证弹窗,开始过盾...');
-      try {
-        await solveCaptcha(page, "[role='dialog']");
-        await page.waitForTimeout(4000);
-      } catch (e) {
-        log(`弹窗验证码处理异常: ${e.message}`);
-      }
-    }
-
-    // 验证 UI 结果
-    const bodyText = await page.evaluate(() => document.body.innerText);
-    if (/Expire dans\s+[2-9]j/i.test(bodyText) || /renouvellement sera disponible/i.test(bodyText)) {
-      const match = bodyText.match(/Expire dans\s+([0-9]+j(?:\s+[0-9]+h)?)/i);
-      const exp = match ? `剩余 ${match[1]}` : '成功延期';
-      log(`UI 续期验证成功: ${exp}`);
-      return { id, ok: true, skip: false, text: `${name} (${id}): 续期成功 (${exp})` };
+  const dialog = await firstVisible(page.locator("[role='dialog']"));
+  if (dialog) {
+    log('UI 兜底: 检测到人机验证弹窗,开始过盾...');
+    try {
+      await solveCaptcha(page, "[role='dialog']");
+      await page.waitForTimeout(3000);
+    } catch (e) {
+      log(`UI 兜底: 弹窗验证码处理异常(忽略): ${e.message}`);
     }
   }
 
-  // 2. API 直接续期及验证码补发
-  log(`尝试 API 续期接口...`);
+  const bodyText = await page.evaluate(() => document.body.innerText);
+  const { confirmed, remaining } = classifyUiText(bodyText);
+  if (confirmed) {
+    const exp = remaining ? `剩余 ${remaining}` : '成功延期';
+    log(`UI 兜底: 续期验证成功: ${exp}`);
+    return { id, ok: true, skip: false, captcha: false, text: `${name} (${id}): 续期成功 (${exp})` };
+  }
+  log('UI 兜底: 未检测到明确的续期成功标识');
+  return null;
+}
+
+/** API 续期（主路径）：确定性、无 UI 依赖。 */
+async function renewViaApi(page, id) {
   const renewPath = `/api/client/servers/${id}/upgrade/renew`;
   let r = await api(page, renewPath, 'POST', {});
   let c = classifyRenew(r);
 
   if (c.captcha) {
-    log(`检测到 captcha_required,获取 renewal_gate 验证码凭据...`);
+    log('检测到 captcha_required,获取 renewal_gate 验证码凭据...');
     try {
       const token = await solveCaptchaApi(page, 'renewal_gate');
       r = await api(page, renewPath, 'POST', { captcha_token: token });
@@ -460,6 +514,29 @@ async function tryRenew(page, server) {
       c = { ok: false, skip: false, captcha: false, text: `验证码求解失败: ${e.message}` };
     }
   }
+  return c;
+}
+
+async function tryRenew(page, server) {
+  const id = server.id;
+  const name = server.name || id;
+  log(`开始检查续期: ${name} (${id})`);
+
+  if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
+
+  // 1) API 优先：快、稳、不依赖页面结构
+  log('尝试 API 续期接口...');
+  let c = await renewViaApi(page, id);
+
+  // 2) API 明确失败时才走 UI 兜底（旧版顺序相反，且 UI 抛错会中断全局）
+  if (!c.ok) {
+    log(`API 结果不乐观(${c.text}),启用 UI 兜底...`);
+    const ui = await renewViaUi(page, id, name).catch((e) => {
+      log(`UI 兜底异常(已忽略,不影响判定): ${e.message}`);
+      return null;
+    });
+    if (ui) c = ui;
+  }
 
   let resultText = `${name} (${id}): ${c.text}`;
   const exactRemaining = formatRemaining(server.expiresAt);
@@ -467,19 +544,14 @@ async function tryRenew(page, server) {
     resultText = `${name} (${id}): 未到续期窗口，剩余 ${exactRemaining}`;
   }
 
-  log(`API 续期结果: ${resultText}`);
+  log(`续期结果: ${resultText}`);
   return { id, ok: c.ok, skip: c.skip, text: resultText };
 }
 
+/** 允许用 CHROME_PATH 指定本地 Chrome；CI 上不设则用 Playwright 自带浏览器。 */
 function resolveExecutablePath() {
-  const paths = [
-    process.env.CHROME_PATH,
-    'D:\\PlaywrightBrowsers\\chromium-1217\\chrome-win64\\chrome.exe',
-  ].filter(Boolean);
-  for (const p of paths) {
-    if (fs.existsSync(p)) return p;
-  }
-  return undefined;
+  const p = process.env.CHROME_PATH;
+  return p && fs.existsSync(p) ? p : undefined;
 }
 
 async function main() {
@@ -495,6 +567,8 @@ async function main() {
     viewport: { width: 1440, height: 900 },
     storageState: fs.existsSync(AUTH) ? AUTH : undefined,
   });
+  context.setDefaultTimeout(DEFAULT_TIMEOUT);
+  context.setDefaultNavigationTimeout(DEFAULT_TIMEOUT + 15000);
   const page = await context.newPage();
   let summary = '';
   let failed = false;
@@ -519,8 +593,7 @@ async function main() {
       failed = results.some((r) => !r.ok);
     }
 
-    const hasRenewed = results.some((r) => r.ok && !r.skip);
-    if (hasRenewed) {
+    if (results.some((r) => r.ok && !r.skip)) {
       await shot(page, '06-result.png');
     }
   } catch (e) {
@@ -531,7 +604,6 @@ async function main() {
   } finally {
     await browser.close().catch(() => {});
   }
-  log(summary);
 
   // 截图仅限续期完成和执行失败
   let photoToSend = null;
@@ -568,4 +640,4 @@ if (isMain) {
   });
 }
 
-export { score, ocrScore, classifyRenew };
+export { score, ocrScore, classifyRenew, classifyUiText };

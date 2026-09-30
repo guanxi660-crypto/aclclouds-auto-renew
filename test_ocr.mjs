@@ -1,4 +1,4 @@
-import { score, ocrScore, classifyRenew } from './renew.mjs';
+import { score, ocrScore, classifyRenew, classifyUiText } from './renew.mjs';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -17,5 +17,19 @@ assert(!cap.ok && cap.captcha, '403 captcha_required retries');
 
 const ok = classifyRenew({ status: 200, data: { ok: true } });
 assert(ok.ok && !ok.skip, '200 is success');
+
+// --- classifyUiText: 页面文案判定（兼容法/英） ---
+const frRenewed = classifyUiText('Expire dans 4j 12h');
+assert(frRenewed.confirmed && frRenewed.remaining === '4j12h', 'FR renewed text with countdown');
+
+const enRenewed = classifyUiText('Expires in 3 days');
+assert(enRenewed.confirmed, 'EN renewed text');
+
+// 剩余 1 天属于「未到窗口」，不能被当成续期成功
+const tooEarly = classifyUiText('Expire dans 1j');
+assert(!tooEarly.confirmed, '1 day left must NOT count as renewed');
+
+const nothing = classifyUiText('Bienvenue sur le dashboard');
+assert(!nothing.confirmed && nothing.remaining === null, 'neutral page text');
 
 console.log('ok');

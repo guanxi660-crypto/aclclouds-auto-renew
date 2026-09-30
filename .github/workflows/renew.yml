@@ -25,6 +25,7 @@ jobs:
         with:
           node-version: '22'
 
+      # 登录会话缓存：run_id 作为 key 保证每次刷新，restore-keys 命中上一次
       - uses: actions/cache@v4
         with:
           path: auth.json
@@ -32,10 +33,23 @@ jobs:
           restore-keys: |
             acl-session-
 
+      # 浏览器二进制缓存：省掉每次约 300MB 的 Chromium 下载
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: pw-${{ runner.os }}-${{ hashFiles('package.json') }}
+          restore-keys: |
+            pw-${{ runner.os }}-
+
       - name: Install
         run: |
           npm install
           npx playwright install --with-deps chromium
+
+      - name: Unit tests
+        run: |
+          node test_ocr.mjs
+          node repro-hidden-btn.mjs
 
       - name: Renew
         env:
