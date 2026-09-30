@@ -2,8 +2,10 @@ name: ACLClouds Auto Renew
 
 on:
   schedule:
-    # 每两天执行一次，对应北京时间 (UTC+8) 早上 07:28 (即 UTC 23:28)
-    - cron: '28 23 */2 * *'
+    # 每天执行一次，对应北京时间 (UTC+8) 早上 07:28 (即 UTC 23:28)
+    # 续期窗口只有 1 天宽，间隔必须 <= 1 天才能保证不漏窗。
+    # 未到窗口时脚本幂等返回（400 renewal_not_available 按成功处理），不会误报。
+    - cron: '28 23 * * *'
   workflow_dispatch: {}
 
 permissions:
@@ -60,3 +62,32 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: node renew.mjs
+
+      # 运行记录只保留本次一条（KEEP_RUNS=0）。放在最后，避免删掉自己。
+      # 需要保留排查用的历史时，把 KEEP_RUNS 调大即可。
+      - name: Cleanup old runs
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KEEP_RUNS: '0'
+        run: |
+          runs=$(gh run list \
+            --workflow="${{ github.workflow }}" \
+            --limit=100 \
+            --json databaseId \
+            --jq '.[].databaseId')
+
+          count=0
+          for run_id in $runs; do
+            if [ "$run_id" = "${{ github.run_id }}" ]; then
+              echo "跳过本次运行: $run_id"
+              continue
+            fi
+            count=$((count + 1))
+            if [ "$count" -le "$KEEP_RUNS" ]; then
+              echo "保留 #$count: $run_id"
+            else
+              echo "删除 #$count: $run_id"
+              gh run delete "$run_id" || true
+            fi
+          done

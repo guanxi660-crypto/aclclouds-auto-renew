@@ -1,6 +1,6 @@
 # ACLClouds Auto-Renew
 
-ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1 天才开放续期。脚本用账号密码登录（OCR 过站点自定义验证码），发现真实 server id，调用续期 API。GitHub Actions 每两天跑一次，结果发 Telegram。
+ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1 天才开放续期。脚本用账号密码登录（OCR 过站点自定义验证码），发现真实 server id，调用续期 API。GitHub Actions 每天跑一次，结果发 Telegram。
 
 ## 做什么
 
@@ -29,7 +29,7 @@ ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1
 
 ## GitHub Actions
 
-`.github/workflows/renew.yml`：每两天 UTC `23:28`（北京时间次日 `07:28`），也可手动 Run workflow。
+`.github/workflows/renew.yml`：每天 UTC `23:28`（北京时间次日 `07:28`），也可手动 Run workflow。
 
 Secrets：
 
