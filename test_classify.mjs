@@ -1,14 +1,10 @@
-import { score, ocrScore, classifyRenew, classifyUiText } from './renew.mjs';
+import { classifyRenew, classifyUiText } from './renew.mjs';
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
 }
 
-assert(score('ACLCiouds', 'ACLClouds') >= 75, '1-letter OCR miss should still score');
-assert(ocrScore('ACLCiouds', 'ACLClouds', 'ACLClouds') >= 80, 'vocab-corrected ACLCiouds must pass threshold');
-assert(ocrScore('Serveur', 'Serveur', 'Serveur') === 100, 'exact Serveur');
-assert(ocrScore('Semeur', 'Serveur', 'ACLClouds') < 80, 'wrong tile must not match prompt');
-
+// --- classifyRenew: 续期接口返回判定 ---
 const skip = classifyRenew({ status: 400, data: { error: 'renewal_not_available', days_remaining: 1 } });
 assert(skip.ok && skip.skip, 'window-closed is ok skip');
 
@@ -17,6 +13,29 @@ assert(!cap.ok && cap.captcha, '403 captcha_required retries');
 
 const ok = classifyRenew({ status: 200, data: { ok: true } });
 assert(ok.ok && !ok.skip, '200 is success');
+
+// 真实改版后的成功响应（取自 HAR）
+const real = classifyRenew({
+  status: 200,
+  data: {
+    success: true,
+    message: 'Serveur renouvelé avec succès.',
+    expires_at: '2026-10-08T21:51:26+02:00',
+    balance: 0,
+  },
+});
+assert(real.ok && !real.skip, 'real 200 payload is success');
+
+// 真实改版后的 403 响应（取自 HAR）——必须触发验证码路径
+const real403 = classifyRenew({
+  status: 403,
+  data: {
+    error: 'captcha_required',
+    code: 'captcha_required',
+    message: "Confirmez que vous n'êtes pas un robot pour renouveler ce service gratuit.",
+  },
+});
+assert(!real403.ok && real403.captcha, 'real 403 payload triggers captcha path');
 
 // --- classifyUiText: 页面文案判定（兼容法/英） ---
 const frRenewed = classifyUiText('Expire dans 4j 12h');

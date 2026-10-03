@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { chromium } from 'playwright';
-import Tesseract from 'tesseract.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'node:url';
+import { solveCap } from './cap-solver.mjs';
 
 const BASE = (process.env.ACL_BASE_URL || 'https://aclclouds.com').replace(/\/+$/, '');
 const USER = process.env.ACL_USERNAME || process.env.ACL_EMAIL || '';
@@ -23,41 +23,10 @@ const RENEW_BTN_SEL = [
   'button:has-text("Renew")',
 ].join(', ');
 
-const VOCAB = [
-  'Panel', 'VPS', 'Bot', 'Serveur', 'Cloud', 'ACLClouds',
-  'Minecraft', 'Discord', 'Housing', 'Tunnel', 'Dedicated',
-  'Free', 'Upgrade', 'Renew', 'Game', 'Node', 'Credit', 'Support'
-];
-
 fs.mkdirSync(SHOT, { recursive: true });
 
 function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
-}
-
-function norm(s) {
-  return String(s || '').toLowerCase().replace(/[^a-z]/g, '');
-}
-
-function score(a, b) {
-  a = norm(a);
-  b = norm(b);
-  if (!a || !b) return 0;
-  if (a === b) return 100;
-  if (a.includes(b) || b.includes(a)) return 80;
-  const dp = Array.from({ length: a.length + 1 }, (_, i) => Array(b.length + 1).fill(0));
-  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
-  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      dp[i][j] = Math.min(dp[i - 1][j] + 1, dp[i][j - 1] + 1, dp[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
-    }
-  }
-  return Math.max(0, 100 - dp[a.length][b.length] * 25);
-}
-
-function ocrScore(text, guess, prompt) {
-  return Math.max(score(text, prompt), score(guess, prompt));
 }
 
 function escapeHtml(s) {
@@ -194,132 +163,6 @@ function formatTgMessage({ failed, results = [], errorMsg = '' }) {
   return lines.join('\n');
 }
 
-async function ocrPick(dir, prompt, n) {
-  const worker = await Tesseract.createWorker('eng');
-  await worker.setParameters({
-    tessedit_pageseg_mode: '7',
-    tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
-  });
-  const results = [];
-  for (let i = 0; i < n; i++) {
-    const file = path.join(dir, `${i}.png`);
-    const r = await worker.recognize(file);
-    const text = (r.data.text || '').replace(/\s+/g, '').trim();
-    const best = VOCAB.map((v) => ({ v, s: score(text, v) })).sort((p, q) => q.s - p.s)[0];
-    results.push({ i, text, guess: best.v, vsPrompt: ocrScore(text, best.v, prompt) });
-  }
-  await worker.terminate();
-  results.sort((a, b) => b.vsPrompt - a.vsPrompt);
-  log(`OCR prompt=${prompt} ${results.map((x) => `${x.i}:${x.text || x.guess}(${x.vsPrompt})`).join(' ')}`);
-  if (!results[0] || results[0].vsPrompt < 75) throw new Error(`OCR 未匹配 ${prompt}: ${JSON.stringify(results)}`);
-  return results[0].i;
-}
-
-async function solveCaptcha(page, prefix = '') {
-  const root = prefix ? `${prefix} ` : '';
-  const checkbox = page.locator(`${root}div[role='checkbox']`).first();
-  await checkbox.click({ timeout: DEFAULT_TIMEOUT });
-  await page.waitForSelector(`${root}.auth-captcha-option-img`, { timeout: DEFAULT_TIMEOUT });
-  await page.waitForFunction(
-    (sel) => {
-      const imgs = [...document.querySelectorAll(sel)];
-      return imgs.length > 0 && imgs.every((i) => i.naturalWidth > 0 && i.clientHeight > 0);
-    },
-    `${root}.auth-captcha-option-img`,
-    { timeout: DEFAULT_TIMEOUT }
-  );
-
-  const promptRaw = await page.locator(`${root}.auth-captcha-prompt`).innerText();
-  const prompt = promptRaw.replace(/^(?:Click on|Cliquez sur)\s+/i, '').trim();
-  const imgs = page.locator(`${root}.auth-captcha-option-img`);
-  const n = await imgs.count();
-  const dir = path.join(SHOT, 'captcha');
-  fs.mkdirSync(dir, { recursive: true });
-  for (let i = 0; i < n; i++) {
-    const src = await imgs.nth(i).getAttribute('src');
-    const url = src.startsWith('http') ? src : BASE + src;
-    const bytes = await page.evaluate(async (u) => {
-      const r = await fetch(u, { credentials: 'include' });
-      return Array.from(new Uint8Array(await r.arrayBuffer()));
-    }, url);
-    fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
-  }
-  await shot(page, '02-captcha.png');
-  const pick = await ocrPick(dir, prompt, n);
-  await page.locator(`${root}.auth-captcha-option`).nth(pick).evaluate((el) => el.click());
-  await page.waitForFunction(
-    (sel) => document.querySelector(sel)?.getAttribute('aria-checked') === 'true',
-    `${root}div[role='checkbox']`,
-    { timeout: DEFAULT_TIMEOUT }
-  );
-  log(`验证码通过: ${prompt} -> option ${pick + 1}`);
-}
-
-async function solveCaptchaApi(page, context = 'renewal_gate') {
-  log(`通过 API 求解验证码 (context: ${context})...`);
-  const challengeRes = await api(page, `/auth/captcha/challenge?context=${encodeURIComponent(context)}`);
-  if (challengeRes.status !== 200 || !challengeRes.data?.id) {
-    throw new Error(`获取验证码 challenge 失败: HTTP ${challengeRes.status}`);
-  }
-  const chal = challengeRes.data;
-  await page.waitForTimeout(1200);
-
-  const initialVerify = await api(page, '/auth/captcha', 'POST', {
-    context: chal.context || context,
-    id: chal.id,
-    ts: chal.ts,
-    sig: chal.sig,
-    elapsed: 1400,
-  });
-
-  if (initialVerify.status !== 200) {
-    throw new Error(`验证码初始验证失败: HTTP ${initialVerify.status}`);
-  }
-
-  const ver = initialVerify.data;
-  if (ver.passed && ver.token) {
-    log('验证码无感直通成功');
-    return ver.token;
-  }
-
-  if (!ver.interactive || !ver.target || !Array.isArray(ver.options)) {
-    throw new Error(`验证码返回非交互态: ${JSON.stringify(ver)}`);
-  }
-
-  const target = ver.target;
-  const options = ver.options;
-  const dir = path.join(SHOT, 'captcha_api');
-  fs.mkdirSync(dir, { recursive: true });
-
-  for (let i = 0; i < options.length; i++) {
-    const imgUrl = `${BASE}/auth/captcha/image?t=${encodeURIComponent(options[i])}`;
-    const bytes = await page.evaluate(async (u) => {
-      const r = await fetch(u, { credentials: 'include' });
-      return Array.from(new Uint8Array(await r.arrayBuffer()));
-    }, imgUrl);
-    fs.writeFileSync(path.join(dir, `${i}.png`), Buffer.from(bytes));
-  }
-
-  const pick = await ocrPick(dir, target, options.length);
-  const selectedOption = options[pick];
-
-  const submitVerify = await api(page, '/auth/captcha', 'POST', {
-    context: ver.context || context,
-    id: ver.id,
-    ts: ver.ts,
-    sig: ver.sig,
-    answer: selectedOption,
-    answer_sig: ver.answer_sig || '',
-    target: target,
-  });
-
-  if (submitVerify.status === 200 && submitVerify.data?.passed && submitVerify.data?.token) {
-    log(`API 验证码成功解决: ${target} -> token 获得`);
-    return submitVerify.data.token;
-  }
-  throw new Error(`API 验证码选项提交未通过: ${JSON.stringify(submitVerify.data)}`);
-}
-
 async function api(page, p, method = 'GET', body) {
   return page.evaluate(async ({ p, method, body }) => {
     const token = document.cookie.split('; ').find((c) => c.startsWith('XSRF-TOKEN='))?.split('=')[1];
@@ -347,6 +190,58 @@ async function loggedIn(page) {
   return r.status === 200 && r.data?.object === 'user';
 }
 
+/**
+ * 从页面的 bootstrap 数据里读 cap.js 配置。
+ * 站点把它注入在 <script id="client-bootstrap-data"> 里：
+ *   siteConfiguration.recaptcha = { enabled, siteKey, apiEndpoint }
+ * 这是服务端渲染的，无需扒打包后的 JS。
+ */
+async function readCapConfig(page) {
+  const cfg = await page.evaluate(() => {
+    const el = document.getElementById('client-bootstrap-data');
+    if (!el) return null;
+    try {
+      const j = JSON.parse(el.textContent);
+      const r = j?.siteConfiguration?.recaptcha;
+      if (!r || !r.enabled) return null;
+      return { siteKey: r.siteKey || '', apiEndpoint: r.apiEndpoint || '' };
+    } catch {
+      return null;
+    }
+  });
+  if (!cfg || !cfg.apiEndpoint) return null;
+  // 兜底：老版本可能只给 siteKey
+  if (!cfg.apiEndpoint && cfg.siteKey) {
+    cfg.apiEndpoint = `https://cap.aclclouds.com/${cfg.siteKey}/`;
+  }
+  return cfg;
+}
+
+/**
+ * 登录时若遇到验证码，尝试用 cap.js 求解。
+ * 改版后登录页也挂了 Cap；旧的「点图选词」已从代码中移除，
+ * 若站点回退到旧方案，这里会明确报错而不是静默失败。
+ */
+async function passLoginCaptcha(page) {
+  const cfg = await readCapConfig(page);
+  if (!cfg) {
+    log('登录页未发现 cap.js 配置（可能不需要验证码，或站点已换方案）');
+    return false;
+  }
+  const token = await solveCap(page, cfg.apiEndpoint, { log });
+  // 把 token 塞进页面，供登录表单提交时使用
+  await page.evaluate((t) => {
+    window.__aclCapToken = t;
+    const input = document.querySelector(
+      'input[name="captcha_token"], input[name="recaptcha_token"], input[name="cap_token"]'
+    );
+    if (input) input.value = t;
+    window.dispatchEvent(new CustomEvent('acl:cap-solved', { detail: { token: t } }));
+  }, token);
+  log('登录验证码已求解并注入页面');
+  return true;
+}
+
 async function login(page) {
   log(`登录 ${BASE} as ${USER}`);
   await page.goto(`${BASE}/auth/login`, { waitUntil: 'domcontentloaded' });
@@ -361,23 +256,19 @@ async function login(page) {
   await page.fill('#username', USER);
   await page.fill('#password', PASS);
   await shot(page, '01-login.png');
-  let authed = false;
   let lastErr = '';
-  for (let i = 0; i < 4 && !authed; i++) {
-    try {
-      await solveCaptcha(page);
-      authed = true;
-    } catch (e) {
-      lastErr = e.message;
-      log(`验证码失败(${i + 1}/4): ${e.message}`);
-      await page.reload({ waitUntil: 'domcontentloaded' });
-      await page.fill('#username', USER);
-      await page.fill('#password', PASS);
-    }
+  try {
+    await passLoginCaptcha(page);
+  } catch (e) {
+    lastErr = e.message;
+    log(`登录验证码求解失败: ${e.message}`);
   }
-  if (!authed) throw new Error(`验证码多次失败: ${lastErr}`);
   await page.click("button[type='submit']");
-  await page.waitForURL(/\/dashboard/, { timeout: DEFAULT_TIMEOUT + 10000 });
+  try {
+    await page.waitForURL(/\/dashboard/, { timeout: DEFAULT_TIMEOUT + 20000 });
+  } catch (e) {
+    throw new Error(`提交登录后未进入 dashboard${lastErr ? `（验证码: ${lastErr}）` : ''}`);
+  }
   await page.context().storageState({ path: AUTH });
   log(`登录成功,会话写入 ${AUTH}`);
 }
@@ -478,9 +369,10 @@ async function renewViaUi(page, id, name) {
 
   const dialog = await firstVisible(page.locator("[role='dialog']"));
   if (dialog) {
-    log('UI 兜底: 检测到人机验证弹窗,开始过盾...');
+    log('UI 兜底: 检测到人机验证弹窗,尝试过盾...');
     try {
-      await solveCaptcha(page, "[role='dialog']");
+      const cfg = await readCapConfig(page);
+      if (cfg) await solveCap(page, cfg.apiEndpoint, { log });
       await page.waitForTimeout(3000);
     } catch (e) {
       log(`UI 兜底: 弹窗验证码处理异常(忽略): ${e.message}`);
@@ -505,9 +397,12 @@ async function renewViaApi(page, id) {
   let c = classifyRenew(r);
 
   if (c.captcha) {
-    log('检测到 captcha_required,获取 renewal_gate 验证码凭据...');
+    log('检测到 captcha_required，走 cap.js（PoW）验证码流程...');
     try {
-      const token = await solveCaptchaApi(page, 'renewal_gate');
+      const cfg = await readCapConfig(page);
+      if (!cfg) throw new Error('页面里没找到 recaptcha/cap 配置');
+      const token = await solveCap(page, cfg.apiEndpoint, { log });
+      log('带 captcha_token 重发续期请求...');
       r = await api(page, renewPath, 'POST', { captcha_token: token });
       c = classifyRenew(r);
     } catch (e) {
@@ -640,4 +535,4 @@ if (isMain) {
   });
 }
 
-export { score, ocrScore, classifyRenew, classifyUiText };
+export { classifyRenew, classifyUiText };

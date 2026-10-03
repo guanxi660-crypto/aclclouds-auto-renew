@@ -1,19 +1,45 @@
 # ACLClouds Auto-Renew
 
-ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1 天才开放续期。脚本用账号密码登录（OCR 过站点自定义验证码），发现真实 server id，调用续期 API。GitHub Actions 每天跑一次，结果发 Telegram。
+ACLClouds Free Bot 托管自动续期。Free 套餐约 4 天到期，到期前 1 天才开放续期。脚本用账号密码登录（过站点的 cap.js 工作量证明验证码），发现真实 server id，调用续期 API。GitHub Actions 每天跑一次，结果发 Telegram。
 
 ## 做什么
 
 1. Playwright 打开 `/auth/login`，填 `ACL_USERNAME` / `ACL_PASSWORD`
-2. 点「I am not a robot」，四选一词图用 tesseract.js 对 prompt 识别后点击
+2. 过登录验证码（cap.js PoW，见下），提交登录
 3. 登录进 dashboard，调 `/api/client` 拿服务列表（含真实 server id 与 `expires_at`）
 4. `POST /api/client/servers/{id}/upgrade/renew`
    - `200` 续期成功
    - `400 renewal_not_available` 未到窗口（按成功处理）
-   - `403 captcha_required` 走 `renewal_gate` 验证码后重试
+   - `403 captcha_required` 过 cap.js PoW 后带 `captcha_token` 重试
    - 其它状态当失败
-5. API 失败时才启用 UI 兜底（点 dashboard 的「Renouveler」按钮，含弹窗过盾）
+5. API 失败时才启用 UI 兜底（点 dashboard 的「Renouveler」按钮，弹窗里同样过 cap.js）
 6. Telegram 通知（见下）
+
+## 验证码：cap.js 工作量证明
+
+2026-10 平台改版，验证码从「点图选词」换成了 [Cap](https://github.com/tiagozip/cap)：
+不是识别图像，而是算一道 SHA-256 的 proof-of-work。
+
+流程：
+
+```
+POST /api/client/servers/{id}/upgrade/renew        -> 403 {"error":"captcha_required"}
+POST {apiEndpoint}challenge                        -> { token, challenges:[{protocol:"hashwx",payload}] }
+   对每个 hashwx 挑战求 nonce，使 hashwx(seed, nonce) <= U64_MAX / d
+POST {apiEndpoint}redeem { token, solutions }      -> { success:true, token }
+POST /api/client/servers/{id}/upgrade/renew { captcha_token }   -> 200
+```
+
+- `apiEndpoint` 由服务端注入在页面 `<script id="client-bootstrap-data">` 里
+  （`siteConfiguration.recaptcha`，本站为 `https://cap.aclclouds.com/235a82a3e3/`）。
+- 求解核心是官方 `core/src/hashwx.js`（**vendored** 到 `vendor/cap/`，wasm 以 base64 内嵌），
+  **不拉 jsDelivr**，离线可跑、CI 不受 CDN 可达性影响。
+- **并行**：用 `node:worker_threads` 真正多核并行（`cap-solver.mjs` + `cap-pow-worker.mjs`），
+  worker 之间按 block 同余类分片，谁先解出就终止全部。并发度由 `CAP_POW_WORKERS` 控制。
+  单线程里塞多个分片只是串行，拿不到加速 —— wasm 求解是同步的，会阻塞事件循环。
+
+实测（4 个挑战，`d=250000, n=65536`）：串行约 44s → 4 worker 并行约 **7.2s**。算法已用 HAR 里
+的真实挑战做过回归（见 `test_cap_pow.mjs`）。
 
 实测：账号 `aclbot_638370` 的真实 server id 是 `da9333c4`（不是面板 URL 里的 `5c0ab2ab`）。
 
@@ -54,25 +80,29 @@ node with-env.cjs
 
 `DRY_RUN=1` 只登录和发现服务，不 POST renew。
 
+`npm test` 跑全部离线回归（响应分类 + PoW 算法 + 隐藏按钮场景），不联网、不改数据。
+
 ## 已完成 / 待做
 
 **已完成**
 
 - 账号密码登录，不再依赖手动导出 session cookie
-- 站点自定义验证码（Click on Panel/Bot/Discord…）OCR 可过，workflow 已实测
+- 适配 2026-10 改版：验证码换成 cap.js（hashwx PoW），登录与续期两条路径都走 `solveCap`
+- 官方 hashwx wasm vendored 进仓库 + worker_threads 并行，4 挑战约 7.2s 出 token
 - 自动发现真实 Pterodactyl server id（`da9333c4`），并跳过面板短 id `5c0ab2ab` 的 404
 - 续期接口打通；窗口外返回 `renewal_not_available` 视为正常
 - Actions 定时 + Secrets / Variable
 - TG：成功或未到窗口只发最终续期状态；失败才发续期/报错截图。登录和验证码不通知
-- OCR 用词表校正：`ACLCiouds` 这类 1 字母误差按 `ACLClouds` 计
 - 登录成功写入 `auth.json`，Actions cache 下次跳过验证码；失效则删掉重登
-- `403 captcha_required` 再过一次验证码后重试续期
+- `403 captcha_required` 过 PoW 后带 `captcha_token` 重试续期
 - 未设 `ACL_SERVER_ID` 时对发现的每台都续；设了则只打这一台
 - API 优先、UI 兜底：UI 逻辑全程 try/catch，页面异常不再中断整条续期链路
 - 续期按钮只认「可见」元素（`firstVisible`），修掉隐藏按钮导致 `click` 30s 超时的问题
-- 回归测试：`node test_ocr.mjs`（纯函数）+ `node repro-hidden-btn.mjs`（隐藏按钮场景），已接入 workflow
+- 回归测试：`test_classify.mjs`（响应/文案分类）+ `test_cap_pow.mjs`（PoW 算法，含 HAR 真实挑战）
+  + `repro-hidden-btn.mjs`（隐藏按钮场景），已接入 workflow。`npm test` 一把跑完
 
 **待做**
 
 - 等窗口打开再打一次，确认 `200` 后续期天数真的往后推
-- OCR 极端扭曲图仍可能卡死（认空/认错会换题，最多 4 次）
+- 登录路径的 PoW 只在代码上接了，尚未拿真实登录 challenge 端到端验证
+- UI 兜底路径（弹窗过盾）尚未端到端验证

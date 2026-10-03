@@ -3,10 +3,10 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "renew": "node renew.mjs"
+    "renew": "node renew.mjs",
+    "test": "node test_classify.mjs && node test_cap_pow.mjs && node repro-hidden-btn.mjs"
   },
   "dependencies": {
-    "playwright": "^1.49.1",
-    "tesseract.js": "^5.1.1"
+    "playwright": "1.49.1"
   }
 }

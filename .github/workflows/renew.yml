@@ -50,7 +50,8 @@ jobs:
 
       - name: Unit tests
         run: |
-          node test_ocr.mjs
+          node test_classify.mjs
+          node test_cap_pow.mjs
           node repro-hidden-btn.mjs
 
       - name: Renew
@@ -61,6 +62,8 @@ jobs:
           ACL_BASE_URL: ${{ vars.ACL_BASE_URL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          # PoW 求解并发度。GitHub runner 通常 4 vCPU，留一部分给浏览器。
+          CAP_POW_WORKERS: '4'
         run: node renew.mjs
 
       # 运行记录只保留本次一条（KEEP_RUNS=0）。放在最后，避免删掉自己。
