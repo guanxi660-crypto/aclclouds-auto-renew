@@ -53,6 +53,27 @@ POST /api/client/servers/{id}/upgrade/renew { captcha_token }   -> 200
 
 登录、验证码过程不发 TG。本地仍会把全过程截图写到 `shots/`。
 
+通知样式（每台服务一个块）：
+
+```
+🇫🇷 ACLClouds 续期通知
+📊 状态: ⏭️ 本轮无需续期
+🕒 执行时间: 2026-10-06 00:07:14 (UTC+8)
+
+📦 Mon VPS 8817 · Free
+🧠 规格: 315MB / 0.5 cores / 715MB 磁盘
+📅 到期时间: 2026-10-09 03:51 (UTC+8)
+⏳ 剩余: 75小时44分
+⏳ 下次可续期: 51小时44分后
+
+📌 站点限制到期前 24 小时开放续期，下次自动处理
+```
+
+- 套餐名取自 `/api/client/credits/subscriptions` 的 `plan_name`，取不到就不显示该行。
+- 规格取自 `/api/client` 的 `limits`（`memory` MB / `cpu`% ÷ 100 转 cores / `disk` MB）。
+- 「下次可续期」= 到期时间 − 24 小时；已进入窗口则显示「已开放」。
+- 时间统一按 UTC+8 输出，用固定 +8 偏移计算，不依赖运行时 tz 数据库。
+
 ## GitHub Actions
 
 `.github/workflows/renew.yml`：每天 UTC `23:28`（北京时间次日 `07:28`），也可手动 Run workflow。
@@ -93,6 +114,8 @@ node with-env.cjs
 - 续期接口打通；窗口外返回 `renewal_not_available` 视为正常
 - Actions 定时 + Secrets / Variable
 - TG：成功或未到窗口只发最终续期状态；失败才发续期/报错截图。登录和验证码不通知
+- 通知改成对齐的键值卡片（状态/执行时间 + 每台一块：套餐/规格/到期/剩余/下次可续期），
+  时间统一 UTC+8；已加排版回归测试
 - 登录成功写入 `auth.json`，Actions cache 下次跳过验证码；失效则删掉重登
 - `403 captcha_required` 过 PoW 后带 `captcha_token` 重试续期
 - 未设 `ACL_SERVER_ID` 时对发现的每台都续；设了则只打这一台

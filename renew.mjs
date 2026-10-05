@@ -107,57 +107,106 @@ async function tg(text, { photo = null } = {}) {
   }
 }
 
+/** 站点规则：到期前 24 小时才开放续期（用于算「下次可续期」）。 */
+const RENEW_OPEN_BEFORE_MS = 24 * 3600 * 1000;
+
+/**
+ * 北京时间的年月日时分秒。
+ * 用固定 +8 偏移而不是 toLocaleString('Asia/Shanghai')：
+ * 不依赖运行时的 tz 数据库，中国不实行夏令时，固定偏移永远正确。
+ */
+function bjParts(ms) {
+  const d = new Date(ms + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return {
+    Y: d.getUTCFullYear(),
+    M: p(d.getUTCMonth() + 1),
+    D: p(d.getUTCDate()),
+    h: p(d.getUTCHours()),
+    m: p(d.getUTCMinutes()),
+    s: p(d.getUTCSeconds()),
+  };
+}
+
+/** 2026-10-06 00:07:14 (UTC+8) */
+function fmtDateTime(ms) {
+  const p = bjParts(ms);
+  return `${p.Y}-${p.M}-${p.D} ${p.h}:${p.m}:${p.s} (UTC+8)`;
+}
+
+/** 2026-10-09 03:51 (UTC+8) */
+function fmtDateTimeShort(ms) {
+  const p = bjParts(ms);
+  return `${p.Y}-${p.M}-${p.D} ${p.h}:${p.m} (UTC+8)`;
+}
+
+/** 毫秒 -> "137小时53分"；不足 1 小时只显示分钟。 */
+function fmtDuration(ms) {
+  if (!(ms > 0)) return '已到期';
+  const totalMin = Math.floor(ms / 60000);
+  const h = Math.floor(totalMin / 60);
+  const m = totalMin % 60;
+  return h > 0 ? `${h}小时${m}分` : `${m}分`;
+}
+
+/** Pterodactyl limits -> "315MB / 0.5 cores / 715MB 磁盘"。 */
+function formatSpec(limits) {
+  if (!limits) return '';
+  const parts = [];
+  if (limits.memory) parts.push(`${limits.memory}MB`);
+  if (limits.cpu) parts.push(`${(limits.cpu / 100).toFixed(2).replace(/\.?0+$/, '')} cores`);
+  if (limits.disk) parts.push(`${limits.disk}MB 磁盘`);
+  return parts.join(' / ');
+}
+
 function formatTgMessage({ failed, results = [], errorMsg = '' }) {
-  const beijingTime = new Date().toLocaleString('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
-
+  const now = Date.now();
   const hasRenewed = results.some((r) => r.ok && !r.skip);
-  const allSkipped = results.length > 0 && results.every((r) => r.ok && r.skip);
 
-  let title = '✅ <b>【ACLClouds 自动续期成功】</b>';
-  let badge = '🎉 服务续期成功';
-  if (failed) {
-    title = '❌ <b>【ACLClouds 自动续期失败】</b>';
-    badge = '⚠️ 续期任务异常';
-  } else if (allSkipped) {
-    title = '⏳ <b>【ACLClouds 续期检查 - 未到窗口】</b>';
-    badge = 'ℹ️ 暂未到可续期时间';
-  }
+  let status = '⏭️ 本轮无需续期';
+  if (failed) status = '❌ 续期失败';
+  else if (hasRenewed) status = '✅ 续期成功';
 
   const lines = [
-    title,
-    '━━━━━━━━━━━━━━━━━━━━',
-    `🕒 <b>执行时间</b>: ${beijingTime} (北京时间)`,
-    `👤 <b>当前账号</b>: <code>${escapeHtml(USER || '未设置')}</code>`,
-    `📊 <b>任务状态</b>: ${badge}`,
-    '━━━━━━━━━━━━━━━━━━━━',
-    '<b>服务详情</b>:',
+    '🇫🇷 <b>ACLClouds 续期通知</b>',
+    `📊 状态: ${status}`,
+    `🕒 执行时间: ${fmtDateTime(now)}`,
   ];
 
   if (failed && errorMsg) {
-    lines.push(`• 异常原因: ${escapeHtml(errorMsg)}`);
+    lines.push(`⚠️ 异常: ${escapeHtml(errorMsg)}`);
   }
 
   for (const r of results) {
-    const icon = r.ok ? (r.skip ? '⏳' : '✅') : '❌';
-    lines.push(`• ${icon} ${escapeHtml(r.text)}`);
+    lines.push('');
+    const head = r.plan ? `${escapeHtml(r.name)} · ${escapeHtml(r.plan)}` : escapeHtml(r.name);
+    lines.push(`📦 <b>${head}</b>`);
+
+    if (r.spec) lines.push(`🧠 规格: ${escapeHtml(r.spec)}`);
+
+    const expMs = r.expiresAt ? new Date(r.expiresAt).getTime() : NaN;
+    if (!isNaN(expMs)) {
+      lines.push(`📅 到期时间: ${fmtDateTimeShort(expMs)}`);
+      const left = expMs - now;
+      lines.push(`⏳ 剩余: ${fmtDuration(left)}`);
+      lines.push(
+        left > RENEW_OPEN_BEFORE_MS
+          ? `⏳ 下次可续期: ${fmtDuration(left - RENEW_OPEN_BEFORE_MS)}后`
+          : '⏳ 下次可续期: 已开放'
+      );
+    }
+
+    if (!r.ok) lines.push(`❌ 失败原因: ${escapeHtml(r.reason || r.detail || '未知')}`);
+    else if (!r.skip) lines.push('✅ 已成功延期');
   }
 
-  lines.push('━━━━━━━━━━━━━━━━━━━━');
+  lines.push('');
   if (failed) {
-    lines.push('⚠️ 请及时查看 GitHub Actions 运行日志与失败截图排查。');
+    lines.push('📌 请查看 GitHub Actions 运行日志与失败截图排查。');
   } else if (hasRenewed) {
-    lines.push('✨ 服务已成功延期，将在下次预定周期继续自动守护。');
+    lines.push('📌 服务已成功延期，下次预定周期继续自动守护。');
   } else {
-    lines.push('📌 站点限制到期前 1 天才开放续期，下次执行将自动处理。');
+    lines.push('📌 站点限制到期前 24 小时开放续期，下次自动处理');
   }
 
   return lines.join('\n');
@@ -273,44 +322,43 @@ async function login(page) {
   log(`登录成功,会话写入 ${AUTH}`);
 }
 
-function formatRemaining(expiresAt) {
-  if (!expiresAt) return null;
-  const target = new Date(expiresAt).getTime();
-  const diff = target - Date.now();
-  if (isNaN(diff)) return null;
-  if (diff <= 0) return '已到期';
-  const d = Math.floor(diff / 86400000);
-  const h = Math.floor((diff % 86400000) / 3600000);
-  const expStr = new Date(target).toLocaleString('zh-CN', {
-    timeZone: 'Asia/Shanghai',
-    hour12: false,
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  });
-  return `${d}天${h}小时 (到期: ${expStr})`;
-}
-
 async function discover(page) {
   const servers = [];
   const r = await api(page, '/api/client');
   if (r.status === 200 && Array.isArray(r.data?.data)) {
     for (const item of r.data.data) {
       if (item.object === 'server' && item.attributes) {
+        const a = item.attributes;
         servers.push({
-          id: item.attributes.identifier,
-          uuid: item.attributes.uuid,
-          name: item.attributes.name || item.attributes.identifier,
-          expiresAt: item.attributes.expires_at || null,
-          canRenew: !!item.attributes.can_renew,
+          id: a.identifier,
+          uuid: a.uuid,
+          name: a.name || a.identifier,
+          expiresAt: a.expires_at || null,
+          canRenew: !!a.can_renew,
+          plan: '',
+          spec: formatSpec(a.limits),
         });
       }
     }
   }
 
+  // 套餐名（plan_name）只在 credits/subscriptions 里有，尽力而为地取。
+  // 拿不到不影响续期主流程，只是通知里少一行「套餐」。
+  try {
+    const sub = await api(page, '/api/client/credits/subscriptions');
+    const list = Array.isArray(sub.data?.subscriptions) ? sub.data.subscriptions : [];
+    for (const s of list) {
+      const hit = servers.find((x) => x.id === s.id || x.uuid === s.service_id);
+      if (!hit) continue;
+      hit.plan = s.plan_name || s.model || '';
+      if (!hit.expiresAt && s.expires_at) hit.expiresAt = s.expires_at;
+    }
+  } catch (e) {
+    log(`套餐信息获取失败(忽略): ${e.message}`);
+  }
+
   if (SERVER_ID && !servers.some((s) => s.id === SERVER_ID || s.uuid === SERVER_ID)) {
-    servers.push({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID, expiresAt: null, canRenew: false });
+    servers.push({ id: SERVER_ID, uuid: SERVER_ID, name: SERVER_ID, expiresAt: null, canRenew: false, plan: '', spec: '' });
   }
 
   log(`发现服务: ${servers.map((s) => `${s.name}(${s.id}) 到期:${s.expiresAt || '未知'}`).join(', ') || '(无)'}`);
@@ -319,17 +367,28 @@ async function discover(page) {
 
 function classifyRenew(r) {
   if (r.status === 200) {
-    const exp = r.data?.expires_at ? ` (到期: ${r.data.expires_at})` : '';
-    return { ok: true, skip: false, captcha: false, text: `续期成功${exp} ${r.data?.message || JSON.stringify(r.data).slice(0, 120)}` };
+    return {
+      ok: true,
+      skip: false,
+      captcha: false,
+      expiresAt: r.data?.expires_at || null,
+      text: `续期成功 ${r.data?.message || JSON.stringify(r.data).slice(0, 120)}`,
+    };
   }
   if (r.status === 400 && (r.data?.error === 'renewal_not_available' || r.data?.code === 'renewal_not_available')) {
-    return { ok: true, skip: true, captcha: false, text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时` };
+    return {
+      ok: true,
+      skip: true,
+      captcha: false,
+      expiresAt: null,
+      text: `未到续期窗口 剩余 ${r.data.days_remaining ?? r.data.hours_remaining ?? '?'} 天/小时`,
+    };
   }
   const blob = JSON.stringify(r.data);
   if (r.status === 403 && /captcha_required/i.test(blob)) {
-    return { ok: false, skip: false, captcha: true, text: 'HTTP 403 captcha_required' };
+    return { ok: false, skip: false, captcha: true, expiresAt: null, text: 'HTTP 403 captcha_required' };
   }
-  return { ok: false, skip: false, captcha: false, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
+  return { ok: false, skip: false, captcha: false, expiresAt: null, text: `HTTP ${r.status} ${blob.slice(0, 180)}` };
 }
 
 /**
@@ -417,7 +476,18 @@ async function tryRenew(page, server) {
   const name = server.name || id;
   log(`开始检查续期: ${name} (${id})`);
 
-  if (DRY_RUN) return { id, ok: true, skip: true, text: `[DRY_RUN] ${name} (${id}) 跳过实际提交` };
+  const base = { id, name, plan: server.plan || '', spec: server.spec || '' };
+
+  if (DRY_RUN) {
+    return {
+      ...base,
+      ok: true,
+      skip: true,
+      expiresAt: server.expiresAt || null,
+      reason: 'DRY_RUN 跳过实际提交',
+      detail: `${name} (${id}): DRY_RUN 跳过实际提交`,
+    };
+  }
 
   // 1) API 优先：快、稳、不依赖页面结构
   log('尝试 API 续期接口...');
@@ -433,14 +503,16 @@ async function tryRenew(page, server) {
     if (ui) c = ui;
   }
 
-  let resultText = `${name} (${id}): ${c.text}`;
-  const exactRemaining = formatRemaining(server.expiresAt);
-  if (c.skip && exactRemaining) {
-    resultText = `${name} (${id}): 未到续期窗口，剩余 ${exactRemaining}`;
-  }
-
-  log(`续期结果: ${resultText}`);
-  return { id, ok: c.ok, skip: c.skip, text: resultText };
+  const detail = `${name} (${id}): ${c.text}`;
+  log(`续期结果: ${detail}`);
+  return {
+    ...base,
+    ok: c.ok,
+    skip: c.skip,
+    expiresAt: c.expiresAt || server.expiresAt || null,
+    reason: c.text, // 纯原因（不含服务名），供通知里按块展示
+    detail, // 含服务名，供运行日志
+  };
 }
 
 /** 允许用 CHROME_PATH 指定本地 Chrome；CI 上不设则用 Playwright 自带浏览器。 */
@@ -484,7 +556,7 @@ async function main() {
       failed = true;
       summary = '未找到可续期服务';
     } else {
-      summary = results.map((r) => r.text).join('\n');
+      summary = results.map((r) => r.detail).join('\n');
       failed = results.some((r) => !r.ok);
     }
 
@@ -535,4 +607,4 @@ if (isMain) {
   });
 }
 
-export { classifyRenew, classifyUiText };
+export { classifyRenew, classifyUiText, formatTgMessage, fmtDuration };
