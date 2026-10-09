@@ -52,12 +52,22 @@ const nothing = classifyUiText('Bienvenue sur le dashboard');
 assert(!nothing.confirmed && nothing.remaining === null, 'neutral page text');
 
 // --- formatTgMessage: 通知排版（用 HAR 里的真实字段） ---
+// 到期时间用「现在 + 3 天」动态生成：硬编码日期会随真实时间推移变成过去时，
+// 导致「剩余/下次可续期」断言永远失败。
+const EXP_MS = Date.now() + 3 * 24 * 3600 * 1000;
 const SRV = {
   name: 'Mon VPS 8817',
   plan: 'Free',
   spec: '315MB / 0.5 cores / 715MB 磁盘',
-  expiresAt: '2026-10-08T21:51:26+02:00', // = 2026-10-09 03:51 (UTC+8)
+  expiresAt: new Date(EXP_MS).toISOString(),
 };
+
+// 与 renew.mjs 的 fmtDateTimeShort 相同的 UTC+8 渲染逻辑，用于期望值断言
+const __d = new Date(EXP_MS + 8 * 3600 * 1000);
+const __p = (n) => String(n).padStart(2, '0');
+const EXPECTED_SHORT =
+  `${__d.getUTCFullYear()}-${__p(__d.getUTCMonth() + 1)}-${__p(__d.getUTCDate())} ` +
+  `${__p(__d.getUTCHours())}:${__p(__d.getUTCMinutes())} (UTC+8)`;
 
 const skipMsg = formatTgMessage({
   failed: false,
@@ -67,7 +77,7 @@ assert(skipMsg.includes('📊 状态: ⏭️ 本轮无需续期'), 'skip status 
 assert(/🕒 执行时间: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} \(UTC\+8\)/.test(skipMsg), 'exec time format');
 assert(skipMsg.includes('📦 <b>Mon VPS 8817 · Free</b>'), 'service + plan header');
 assert(skipMsg.includes('🧠 规格: 315MB / 0.5 cores / 715MB 磁盘'), 'spec line');
-assert(skipMsg.includes('📅 到期时间: 2026-10-09 03:51 (UTC+8)'), 'expiry rendered in UTC+8');
+assert(skipMsg.includes(`📅 到期时间: ${EXPECTED_SHORT}`), 'expiry rendered in UTC+8');
 assert(/⏳ 剩余: \d+小时\d+分/.test(skipMsg), 'remaining duration');
 assert(/⏳ 下次可续期: \d+小时\d+分后/.test(skipMsg), 'next-renew countdown');
 assert(skipMsg.includes('📌 站点限制到期前 24 小时开放续期'), 'skip footer');
